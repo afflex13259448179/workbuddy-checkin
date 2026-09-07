@@ -1,0 +1,27 @@
+name: WorkBuddy Daily Checkin
+
+on:
+  schedule:
+    # 每天北京时间 09:05 = UTC 01:05
+    - cron: "5 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run checkin
+        env:
+          # 多账号：JSON 数组，格式见 secrets-WORKBUDDY_ACCOUNTS.json（本地已生成，勿提交）
+          # [{"access_token":"...","account_name":"...","uid":"..."}, ...]
+          WORKBUDDY_ACCOUNTS: ${{ secrets.WORKBUDDY_ACCOUNTS }}
+        run: python checkin.py

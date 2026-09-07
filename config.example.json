@@ -1,0 +1,15 @@
+{
+  "accounts": [
+    {
+      "access_token": "账号1的_accessToken_粘贴到这里",
+      "account_name": "18829508086",
+      "uid": "可选，account.uid"
+    },
+    {
+      "access_token": "账号2的_accessToken_粘贴到这里",
+      "account_name": "15332400810",
+      "uid": "可选"
+    }
+  ],
+  "_说明": "本地运行时若不配置此文件，脚本会自动扫描 WorkBuddy 客户端 auth 目录下所有登录态文件（多账号自动去重）。此文件含登录态，已被 .gitignore 排除，禁止提交。"
+}
