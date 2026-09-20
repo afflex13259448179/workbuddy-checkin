@@ -56,13 +56,12 @@ def gha_cmd(kind: str, msg: str) -> None:
 
 
 def _write_step_summary(results: list[tuple[str, bool]], ok: list[str], bad: list[str]) -> None:
-    """把逐账号结果写进 GitHub Actions 的 Job Summary。
+    """把逐账号结果写进 GitHub Actions 的 Job Summary，并同时打进 run 日志。
 
-    部分失败时 job 仍然是绿的，所以这里是唯一稳定可见的失败信号，不能省。
+    部分失败时 job 仍然是绿的，所以这是唯一稳定可见的失败信号，不能省。
+    之所以还要打到 stdout：Job Summary 没有公开的 REST 接口可读取，
+    写进日志才能在事后用 API 复核（也方便直接翻日志排查）。
     """
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not path:
-        return
     lines = [
         "## WorkBuddy 每日签到",
         "",
@@ -82,9 +81,20 @@ def _write_step_summary(results: list[tuple[str, bool]], ok: list[str], bad: lis
         )
     else:
         lines.append("> ✅ 全部账号签到成功。")
+    block = "\n".join(lines)
+
+    if in_actions():
+        try:
+            print(block, flush=True)
+        except Exception:
+            pass
+
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
     try:
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+            fh.write(block + "\n")
     except Exception as e:
         log(f"[!] 写 Job Summary 失败: {e}")
 
