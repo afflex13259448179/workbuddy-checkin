@@ -35,6 +35,60 @@ def log(msg: str) -> None:
         print(line.encode("utf-8", errors="replace").decode("utf-8", errors="replace"), flush=True)
 
 
+def in_actions() -> bool:
+    return bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("GITHUB_STEP_SUMMARY"))
+
+
+def gha_cmd(kind: str, msg: str) -> None:
+    """输出 GitHub Actions annotation。
+
+    注意：workflow command 必须是**整行的开头**，不能带时间戳前缀，
+    所以这里不能走 log()，否则 GitHub 识别不到。
+    """
+    if not in_actions():
+        return
+    # annotation 不支持换行，压成单行
+    flat = " ".join(str(msg).split())
+    try:
+        print(f"::{kind}::{flat}", flush=True)
+    except Exception:
+        pass
+
+
+def _write_step_summary(results: list[tuple[str, bool]], ok: list[str], bad: list[str]) -> None:
+    """把逐账号结果写进 GitHub Actions 的 Job Summary。
+
+    部分失败时 job 仍然是绿的，所以这里是唯一稳定可见的失败信号，不能省。
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    lines = [
+        "## WorkBuddy 每日签到",
+        "",
+        f"- 运行时间（runner 本地）：`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
+        f"- 结果：**成功 {len(ok)}/{len(results)}**",
+        "",
+        "| 账号 | 结果 |",
+        "| --- | --- |",
+    ]
+    for name, okflag in results:
+        lines.append(f"| {name} | {'✅ 成功' if okflag else '❌ 失败'} |")
+    lines.append("")
+    if bad:
+        lines.append(
+            f"> ⚠️ 失败账号：**{', '.join(bad)}** —— 通常是该账号 token 已被服务端回收，"
+            "需要重新登录该账号并刷新 `WORKBUDDY_ACCOUNTS`。"
+        )
+    else:
+        lines.append("> ✅ 全部账号签到成功。")
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as e:
+        log(f"[!] 写 Job Summary 失败: {e}")
+
+
 # ---------------------------------------------------------------- 凭证加载
 
 def _parse_auth_data(data: dict, source: str) -> dict | None:
@@ -312,18 +366,44 @@ def main() -> bool:
     accounts = load_all_credentials()
     if not accounts:
         log("[x] 未找到任何账号凭证：本地无 auth 文件，也未配置 config.json / 环境变量")
+        gha_cmd("error", "未找到任何账号凭证：Secret WORKBUDDY_ACCOUNTS 可能为空或格式错误。")
         return False
 
     log(f"共发现 {len(accounts)} 个账号，开始逐一签到...")
-    results = {}
+    results: list[tuple[str, bool]] = []
     for account in accounts:
-        results[account["account_name"]] = checkin_one(account)
+        name = account["account_name"]
+        try:
+            results.append((name, checkin_one(account)))
+        except Exception as e:
+            # 单个账号的未预期异常不应让整条 job 崩溃并抛出难看的 traceback
+            log(f"[x] {name}: 未预期异常 {type(e).__name__}: {e}")
+            results.append((name, False))
 
     log("=" * 56)
-    ok = [n for n, s in results.items() if s]
-    bad = [n for n, s in results.items() if not s]
+    ok = [n for n, s in results if s]
+    bad = [n for n, s in results if not s]
     log(f"汇总: 成功 {len(ok)}/{len(results)}" + (f"，失败: {', '.join(bad)}" if bad else ""))
-    return not bad
+    _write_step_summary(results, ok, bad)
+
+    # 失败策略：只有「全部账号都失败」才算致命故障，才让 job 报红。
+    # 原因：只有任一账号失败就报红，会让单个 token 被服务端回收这种次级故障
+    # 放大成每天一封的红色告警邮件（9/17–9/19 连续三天的误报就是这么来的）。
+    if not bad:
+        log("结果: 全部账号签到成功。")
+        return True
+    if ok:
+        gha_cmd(
+            "warning",
+            f"部分账号签到失败: {', '.join(bad)}（成功 {len(ok)}/{len(results)}）。"
+            "这些账号的 token 可能已被服务端回收，请重新登录该账号并刷新 Secret WORKBUDDY_ACCOUNTS。",
+        )
+        log("结果: 部分失败（不致命，job 保持绿色，详见 Job Summary）。")
+        return True
+
+    gha_cmd("error", f"全部 {len(results)} 个账号签到失败，请检查凭证有效性与接口可用性。")
+    log("结果: 全部失败，判定为致命故障。")
+    return False
 
 
 if __name__ == "__main__":
