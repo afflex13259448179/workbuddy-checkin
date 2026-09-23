@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -21,6 +22,20 @@ API_BASE = "https://www.codebuddy.cn"
 CHECKIN_STATUS_URL = f"{API_BASE}/v2/billing/meter/checkin-status"
 DAILY_CHECKIN_URL = f"{API_BASE}/v2/billing/meter/daily-checkin"
 REQUEST_TIMEOUT = 20
+
+# 网络抖动保护：接口偶发不可达时，单次请求重试若干次。
+# 只对「网络类」错误重试 —— 401 是确定性的，重试没有意义。
+REQUEST_RETRIES = 3
+RETRY_BACKOFF_SECONDS = (2, 5)
+
+# 若所有账号都因「网络不可达」失败（说明不是凭证问题，而是链路/接口临时故障），
+# 整体等待后重试一轮。2026-09-23 的故障就是这样：runner 侧到接口
+# 连续超时约 40 分钟，5 个账号在 100 秒内全部撞上，而本机同时刻完全正常。
+ALL_NETWORK_RETRY_DELAY = 90
+
+REASON_NETWORK = "network"
+REASON_AUTH = "auth"
+REASON_OTHER = "other"
 
 _AUTH_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "CodeBuddyExtension" / "Data/Public/auth"
 _MAC_AUTH_DIR = Path.home() / "Library/Application Support/CodeBuddyExtension" / "Data/Public/auth"
@@ -55,30 +70,43 @@ def gha_cmd(kind: str, msg: str) -> None:
         pass
 
 
-def _write_step_summary(results: list[tuple[str, bool]], ok: list[str], bad: list[str]) -> None:
+def _write_step_summary(results: list[tuple[str, bool, str]], ok: list[str], bad: list[str]) -> None:
     """把逐账号结果写进 GitHub Actions 的 Job Summary，并同时打进 run 日志。
 
     部分失败时 job 仍然是绿的，所以这是唯一稳定可见的失败信号，不能省。
     之所以还要打到 stdout：Job Summary 没有公开的 REST 接口可读取，
     写进日志才能在事后用 API 复核（也方便直接翻日志排查）。
     """
+    reason_txt = {REASON_NETWORK: "🌐 网络不可达", REASON_AUTH: "🔑 凭证失效", REASON_OTHER: "❓ 其他"}
+    bad_kinds = {r[2] for r in results if not r[1]}
+
     lines = [
         "## WorkBuddy 每日签到",
         "",
         f"- 运行时间（runner 本地）：`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
         f"- 结果：**成功 {len(ok)}/{len(results)}**",
         "",
-        "| 账号 | 结果 |",
-        "| --- | --- |",
+        "| 账号 | 结果 | 失败原因 |",
+        "| --- | --- | --- |",
     ]
-    for name, okflag in results:
-        lines.append(f"| {name} | {'✅ 成功' if okflag else '❌ 失败'} |")
+    for name, okflag, reason in results:
+        mark = "✅ 成功" if okflag else "❌ 失败"
+        lines.append(f"| {name} | {mark} | {reason_txt.get(reason, '') if not okflag else '-'} |")
     lines.append("")
     if bad:
-        lines.append(
-            f"> ⚠️ 失败账号：**{', '.join(bad)}** —— 通常是该账号 token 已被服务端回收，"
-            "需要重新登录该账号并刷新 `WORKBUDDY_ACCOUNTS`。"
-        )
+        if bad_kinds == {REASON_NETWORK}:
+            lines.append(
+                f"> ⚠️ 失败账号：**{', '.join(bad)}** —— 全部是**网络不可达**。"
+                "这**不是**凭证问题：runner 到 `www.codebuddy.cn` 的链路或接口临时故障。"
+                "无需刷新 token；若持续出现，说明该链路已长期不可用。"
+            )
+        elif REASON_AUTH in bad_kinds:
+            lines.append(
+                f"> ⚠️ 失败账号：**{', '.join(bad)}** —— 含**凭证失效**（服务端 401）。"
+                "需重新登录对应账号并刷新 `WORKBUDDY_ACCOUNTS`。"
+            )
+        else:
+            lines.append(f"> ⚠️ 失败账号：**{', '.join(bad)}**，详见上方原因列。")
     else:
         lines.append("> ✅ 全部账号签到成功。")
     block = "\n".join(lines)
@@ -268,7 +296,14 @@ def _build_headers(creds: dict) -> dict[str, str]:
     return headers
 
 
-def _request_json(url: str, creds: dict, method: str = "POST") -> dict | None:
+def _request_once(url: str, creds: dict, method: str = "POST") -> tuple[dict | None, str | None]:
+    """发一次请求，返回 (payload, err)。
+
+    err 的含义（关键：必须区分，否则无法判断是凭证坏了还是网络断了）：
+      None        —— 拿到了响应（可能是业务错误码，但链路是通的）
+      "network"   —— 超时 / 连接失败 / DNS 失败，属于可重试的瞬时故障
+      "http:<code>" —— 服务端返回了非 2xx，401/403 意味着 token 确定性失效
+    """
     req = urllib.request.Request(
         url,
         data=b"{}",
@@ -278,7 +313,7 @@ def _request_json(url: str, creds: dict, method: str = "POST") -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
+            return (json.loads(raw) if raw else {}), None
     except urllib.error.HTTPError as e:
         err_body = ""
         try:
@@ -286,11 +321,26 @@ def _request_json(url: str, creds: dict, method: str = "POST") -> dict | None:
         except Exception:
             pass
         try:
-            return json.loads(err_body) if err_body else None
+            return (json.loads(err_body) if err_body else None), f"http:{e.code}"
         except Exception:
-            return None
-    except Exception:
-        return None
+            return None, f"http:{e.code}"
+    except Exception as e:
+        return None, "network"
+
+
+def _request_json(url: str, creds: dict, method: str = "POST") -> tuple[dict | None, str | None]:
+    """带重试的请求：仅对网络类错误重试，HTTP 层错误立即返回。"""
+    last_err: str | None = None
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        payload, err = _request_once(url, creds, method)
+        if err != REASON_NETWORK:
+            return payload, err
+        last_err = err
+        if attempt < REQUEST_RETRIES:
+            wait = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            log(f"    网络异常（第 {attempt}/{REQUEST_RETRIES} 次尝试），{wait}s 后重试...")
+            time.sleep(wait)
+    return None, last_err
 
 
 def _msg_of(payload: dict | None) -> str:
@@ -324,33 +374,49 @@ def unwrap_data(payload: dict | None) -> dict | None:
 
 # ---------------------------------------------------------------- 单账号签到流程
 
-def checkin_one(account: dict) -> bool:
+def checkin_one(account: dict) -> tuple[bool, str]:
+    """签到单个账号，返回 (是否成功, 失败原因)。
+
+    失败原因取值：""（成功）| REASON_NETWORK | REASON_AUTH | REASON_OTHER。
+    区分「网络不可达」与「token 失效」至关重要：前者是环境问题，不需要换 token。
+    """
     name = account["account_name"]
     candidates = account["candidates"]
     log(f"--- 账号: {name} ({len(candidates)} 个候选 token) ---")
 
+    errs: list[str | None] = []
     for idx, creds in enumerate(candidates, 1):
-        # 1. 查询状态（只读，用于判断 token 是否有效）
-        status_raw = _request_json(CHECKIN_STATUS_URL, creds)
-        if status_raw is None:
-            log(f"    token #{idx} ({creds['_source']}) 无效（401/网络失败），尝试下一个...")
+        # 1. 查询状态（只读，用于判断 token 是否有效 / 链路是否可达）
+        status_raw, err = _request_json(CHECKIN_STATUS_URL, creds)
+        if err is not None:
+            errs.append(err)
+            if err == REASON_NETWORK:
+                log(f"    token #{idx} ({creds['_source']}) 网络不可达/超时"
+                    f"（已重试 {REQUEST_RETRIES} 次）")
+            else:
+                log(f"    token #{idx} ({creds['_source']}) 服务端拒绝（{err}），该 token 疑似已失效")
             continue
+        errs.append(None)
 
         # 2. 领取签到
         if already_checked_in(status_raw):
             log(f"[ok] {name}: 今日已签到，无需重复领取。")
-            return True
+            return True, ""
         status = unwrap_data(status_raw)
         if status:
             log(f"    状态: active={status.get('active')}, streak_days={status.get('streak_days')}")
 
-        result_raw = _request_json(DAILY_CHECKIN_URL, creds)
+        result_raw, err2 = _request_json(DAILY_CHECKIN_URL, creds)
+        if err2 == REASON_NETWORK:
+            errs.append(err2)
+            log(f"[!] {name}: 领取阶段网络不可达/超时（已重试 {REQUEST_RETRIES} 次），尝试下一个 token...")
+            continue
         if already_checked_in(result_raw):
             log(f"[ok] {name}: 今日已签到。")
-            return True
+            return True, ""
         result = unwrap_data(result_raw)
         if result is None:
-            log(f"[!] {name}: 领取失败，尝试下一个 token...")
+            log(f"[!] {name}: 领取失败（{err2 or '响应无法解析'}），尝试下一个 token...")
             continue
 
         success = result.get("success", True)
@@ -359,13 +425,33 @@ def checkin_one(account: dict) -> bool:
         message = result.get("message") or ""
         if success is False:
             log(f"[!] {name}: 领取未成功: {message or result}")
-            return False
+            return False, REASON_OTHER
 
         log(f"[ok] {name}: 签到成功! credit={credit}, streak_days={streak} {message}")
-        return True
+        return True, ""
 
+    # 全部候选 token 都走完了。若每个候选的失败原因都是网络类，则判定为链路故障而非凭证失效。
+    all_network = bool(errs) and all(e == REASON_NETWORK for e in errs)
+    if all_network:
+        log(f"[x] {name}: 网络不可达，未能完成签到（凭证本身大概率没问题）")
+        return False, REASON_NETWORK
     log(f"[x] {name}: 所有候选 token 均无效，需重新登录该账号刷新 token")
-    return False
+    return False, REASON_AUTH
+
+
+def _run_round(accounts: list[dict]) -> list[tuple[str, bool, str]]:
+    """对所有账号跑一轮签到，返回 [(账号名, 是否成功, 失败原因)]。"""
+    results: list[tuple[str, bool, str]] = []
+    for account in accounts:
+        name = account["account_name"]
+        try:
+            okflag, reason = checkin_one(account)
+        except Exception as e:
+            # 单个账号的未预期异常不应让整条 job 崩溃并抛出难看的 traceback
+            log(f"[x] {name}: 未预期异常 {type(e).__name__}: {e}")
+            okflag, reason = False, REASON_OTHER
+        results.append((name, okflag, reason))
+    return results
 
 
 def main() -> bool:
@@ -380,24 +466,25 @@ def main() -> bool:
         return False
 
     log(f"共发现 {len(accounts)} 个账号，开始逐一签到...")
-    results: list[tuple[str, bool]] = []
-    for account in accounts:
-        name = account["account_name"]
-        try:
-            results.append((name, checkin_one(account)))
-        except Exception as e:
-            # 单个账号的未预期异常不应让整条 job 崩溃并抛出难看的 traceback
-            log(f"[x] {name}: 未预期异常 {type(e).__name__}: {e}")
-            results.append((name, False))
+    results = _run_round(accounts)
+    ok = [n for n, s, _ in results if s]
+
+    # 全部失败且原因全是「网络不可达」→ 判定为链路/接口临时抖动，而非凭证问题。
+    # 这种故障窗口往往只有几十分钟，隔一会儿重试一轮就有机会救回来。
+    if not ok and all(r[2] == REASON_NETWORK for r in results):
+        log(f"[!] 全部 {len(results)} 个账号均为网络不可达。"
+            f"{ALL_NETWORK_RETRY_DELAY}s 后整体重试一轮...")
+        time.sleep(ALL_NETWORK_RETRY_DELAY)
+        results = _run_round(accounts)
+        ok = [n for n, s, _ in results if s]
 
     log("=" * 56)
-    ok = [n for n, s in results if s]
-    bad = [n for n, s in results if not s]
+    bad = [n for n, s, _ in results if not s]
     log(f"汇总: 成功 {len(ok)}/{len(results)}" + (f"，失败: {', '.join(bad)}" if bad else ""))
     _write_step_summary(results, ok, bad)
 
     # 失败策略：只有「全部账号都失败」才算致命故障，才让 job 报红。
-    # 原因：只有任一账号失败就报红，会让单个 token 被服务端回收这种次级故障
+    # 原因：只要任一账号失败就报红，会让单个 token 被服务端回收这种次级故障
     # 放大成每天一封的红色告警邮件（9/17–9/19 连续三天的误报就是这么来的）。
     if not bad:
         log("结果: 全部账号签到成功。")
@@ -406,13 +493,22 @@ def main() -> bool:
         gha_cmd(
             "warning",
             f"部分账号签到失败: {', '.join(bad)}（成功 {len(ok)}/{len(results)}）。"
-            "这些账号的 token 可能已被服务端回收，请重新登录该账号并刷新 Secret WORKBUDDY_ACCOUNTS。",
+            "详见 Job Summary 的失败原因列（区分网络不可达与凭证失效）。",
         )
         log("结果: 部分失败（不致命，job 保持绿色，详见 Job Summary）。")
         return True
 
-    gha_cmd("error", f"全部 {len(results)} 个账号签到失败，请检查凭证有效性与接口可用性。")
-    log("结果: 全部失败，判定为致命故障。")
+    # 全失败：必须区分「网络不可达」与「凭证失效」，否则会把链路故障误诊为 token 过期。
+    if all(r[2] == REASON_NETWORK for r in results):
+        gha_cmd(
+            "error",
+            f"全部 {len(results)} 个账号因【网络不可达】失败（已重试 {REQUEST_RETRIES} 次并额外整体重试一轮）。"
+            "这不是凭证问题：runner 到 www.codebuddy.cn 的链路或接口临时不可用。",
+        )
+        log("结果: 全部失败，原因为网络不可达（非凭证问题）。")
+    else:
+        gha_cmd("error", f"全部 {len(results)} 个账号签到失败，请检查凭证有效性与接口可用性。")
+        log("结果: 全部失败，判定为致命故障。")
     return False
 
 
